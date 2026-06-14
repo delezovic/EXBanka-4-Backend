@@ -15,6 +15,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// settleDateOnly strips any time component from a date string so it is safe to
+// insert into a PostgreSQL DATE column (partner banks may send "2026-06-17T00:00:00Z").
+func settleDateOnly(s string) string {
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
+}
+
 // retryExec retries a DB Exec up to 3 times with linear backoff.
 // Uses db.Exec (not ExecContext) so it survives a cancelled request context (e.g. during compensation).
 func retryExec(db *sql.DB, query string, args ...interface{}) {
@@ -1426,7 +1435,7 @@ func (s *OtcServer) CreateInterbankNegotiation(ctx context.Context, req *pb.Crea
 		        $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id`,
 		req.Ticker, sellerID, sellerType,
-		req.Amount, req.PricePerUnit, req.SettlementDate, req.Premium, req.PriceCurrency,
+		req.Amount, req.PricePerUnit, settleDateOnly(req.SettlementDate), req.Premium, req.PriceCurrency,
 		now,
 		req.BuyerRoutingNumber, req.BuyerExternalId,
 		req.SellerRoutingNumber, req.SellerExternalId,
@@ -1459,7 +1468,7 @@ func (s *OtcServer) InterbankCounterOffer(ctx context.Context, req *pb.Interbank
 		SET amount = $1, price_per_stock = $2, settlement_date = $3, premium = $4,
 		    last_modified = $5, modified_by_id = 0, modified_by_type = 'INTERBANK', status = 'PENDING_SELLER'
 		WHERE id = $6`,
-		req.Amount, req.PricePerUnit, req.SettlementDate, req.Premium,
+		req.Amount, req.PricePerUnit, settleDateOnly(req.SettlementDate), req.Premium,
 		now, localID,
 	); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to update negotiation: %v", err)
@@ -1497,6 +1506,11 @@ func (s *OtcServer) InterbankDeleteNegotiation(ctx context.Context, req *pb.Inte
 }
 
 func (s *OtcServer) InterbankAcceptNegotiation(ctx context.Context, req *pb.InterbankNegotiationIdRequest) (*pb.OtcEmptyResponse, error) {
+	resolvedID, _, lookupErr := s.lookupInterbankNegotiation(ctx, req.RoutingNumber, req.ExternalId)
+	if lookupErr != nil {
+		return nil, lookupErr
+	}
+
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to begin tx: %v", err)
@@ -1509,17 +1523,12 @@ func (s *OtcServer) InterbankAcceptNegotiation(ctx context.Context, req *pb.Inte
 	var premium, strikePrice float64
 	var sellerID int64
 	var sellerType string
-	// Protocol path: {sellerRn}/{sellerLocalId} — look up by local id first.
-	localIDInt, parseErr := strconv.ParseInt(req.ExternalId, 10, 64)
-	if parseErr != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid negotiation id")
-	}
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, status, ticker, currency, settlement_date::text, amount, premium, price_per_stock,
 		       seller_id, seller_type
 		FROM otc_negotiations
 		WHERE id = $1 FOR UPDATE`,
-		localIDInt,
+		resolvedID,
 	).Scan(&localID, &currentStatus, &ticker, &currency, &settlementDate, &amount, &premium, &strikePrice,
 		&sellerID, &sellerType)
 	if err == sql.ErrNoRows {
